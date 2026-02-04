@@ -197,6 +197,56 @@ app.get("/buyer/home-stats/:email", verifyJWT, async (req, res) => {
   }
 });
 
+app.post("/tasks", verifyJWT, verifyBuyer, async (req, res) => {
+  const task = req.body;
+  const buyerEmail = req.decoded.email;
+
+  const buyer = await usersCollection.findOne({ email: buyerEmail });
+
+  if (!buyer) {
+    return res.status(404).send({ message: "Buyer not found" });
+  }
+
+  const requiredWorkers = Number(task.required_workers);
+  const payableAmount = Number(task.payable_amount);
+
+  const totalPayable = requiredWorkers * payableAmount;
+
+  if (buyer.coins < totalPayable) {
+    return res.status(400).send({
+      message: "Not available Coin. Purchase Coin",
+    });
+  }
+
+  const newTask = {
+    buyerEmail,
+    buyerName: buyer.name,
+    task_title: task.task_title,
+    task_detail: task.task_detail,
+    required_workers: requiredWorkers,
+    payable_amount: payableAmount,
+    completion_date: new Date(task.completion_date),
+    submission_info: task.submission_info,
+    task_image_url: task.task_image_url,
+    status: "active",
+    createdAt: new Date(),
+  };
+
+  await tasksCollection.insertOne(newTask);
+
+  await usersCollection.updateOne(
+    { email: buyerEmail },
+    { $inc: { coins: -totalPayable } }
+  );
+
+  res.send({
+    success: true,
+    message: "Task added successfully",
+  });
+});
+
+
+
 
 
 
