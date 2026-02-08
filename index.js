@@ -1,12 +1,14 @@
 const express = require('express')
+
 const app = express()
 const cors = require("cors");
+
 require('dotenv').config();
 const admin = require("firebase-admin");
 const Stripe = require("stripe");
 const stripe = new Stripe(process.env.STRIPE_SECRET);
 const port = process.env.PORT || 3000;
-const { MongoClient, ServerApiVersion } = require('mongodb');
+const { MongoClient, ServerApiVersion, ObjectId } = require('mongodb');
 const uri = process.env.DB_URL;
 const serviceAccount = require("./zentaskly-firebase-adminsdk-key.json");
 // Create a MongoClient with a MongoClientOptions object to set the Stable API version
@@ -361,7 +363,7 @@ app.delete("/buyer/tasks/:id", verifyJWT, verifyBuyer, async (req, res) => {
 
 // worker related API's
 
-app.get("/worker/task-list", verifyJWT, async (req, res) => {
+app.get("/worker/task-list", verifyJWT, verifyWorker, async (req, res) => {
   try {
     const tasks = await tasksCollection
       .find({ required_workers: { $gt: 0 } })
@@ -378,6 +380,93 @@ app.get("/worker/task-list", verifyJWT, async (req, res) => {
     );
 
     res.send(tasksWithBuyer);
+  } catch (error) {
+    console.error(error);
+    res.status(500).send({ message: "Server error" });
+  }
+});
+
+
+app.get("/worker/task-details/:id", verifyJWT, verifyWorker, async (req, res) => {
+  const taskId = req.params.id;
+
+  try {
+    const task = await tasksCollection.findOne({ _id: new ObjectId(taskId) });
+    if (!task) return res.status(404).send({ message: "Task not found" });
+
+    res.send(task);
+  } catch (error) {
+    console.error(error);
+    res.status(500).send({ message: "Server error" });
+  }
+});
+
+app.post("/worker/task-submit/:id", verifyJWT, verifyWorker, async (req, res) => {
+  const taskId = req.params.id;
+  const { submission_details } = req.body;
+
+  if (!submission_details) {
+    return res.status(400).send({ message: "Submission details are required" });
+  }
+
+  try {
+    const task = await tasksCollection.findOne({ _id: new ObjectId(taskId) });
+    if (!task) return res.status(404).send({ message: "Task not found" });
+
+    const submission = {
+      task_id: task._id,
+      task_title: task.task_title,
+      payable_amount: task.payable_amount,
+      worker_email: req.decoded.email,
+      worker_name: req.decoded.name,
+      buyer_name: task.buyerName,
+      buyer_email: task.buyerEmail,
+      submission_details,
+      status: "pending",
+      createdAt: new Date(),
+    };
+
+    await submissionsCollection.insertOne(submission);
+    res.send({ success: true, submission });
+  } catch (error) {
+    console.error(error);
+    res.status(500).send({ message: "Server error" });
+  }
+});
+
+
+
+app.post("/worker/task-submit/:id", verifyJWT, verifyWorker, async (req, res) => {
+  const taskId = req.params.id;
+  const email = req.decoded.email;
+  const { submission_details } = req.body;
+
+  if (!submission_details)
+    return res.status(400).send({ message: "Submission details required" });
+
+  try {
+    const task = await tasksCollection.findOne({ _id: new ObjectId(taskId) });
+    if (!task) return res.status(404).send({ message: "Task not found" });
+
+    const worker = await usersCollection.findOne({ email });
+    const buyer = await usersCollection.findOne({ email: task.buyerEmail });
+
+    const submission = {
+      task_id: task._id,
+      task_title: task.task_title,
+      payable_amount: task.payable_amount,
+      worker_email: worker.email,
+      worker_name: worker.name,
+      buyer_name: buyer?.name || "N/A",
+      buyer_email: buyer?.email || "N/A",
+      submission_details,
+      submission_date: new Date(),
+      status: "pending",
+    };
+
+    const result = await submissionsCollection.insertOne(submission);
+
+    res.send({ success: true, submissionId: result.insertedId });
   } catch (error) {
     console.error(error);
     res.status(500).send({ message: "Server error" });
