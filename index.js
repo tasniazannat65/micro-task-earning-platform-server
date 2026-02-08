@@ -3,6 +3,8 @@ const app = express()
 const cors = require("cors");
 require('dotenv').config();
 const admin = require("firebase-admin");
+const Stripe = require("stripe");
+const stripe = new Stripe(process.env.STRIPE_SECRET);
 const port = process.env.PORT || 3000;
 const { MongoClient, ServerApiVersion } = require('mongodb');
 const uri = process.env.DB_URL;
@@ -18,6 +20,7 @@ const client = new MongoClient(uri, {
 admin.initializeApp({
   credential: admin.credential.cert(serviceAccount)
 });
+
 // middleware
 app.use(cors());
 app.use(express.json());
@@ -163,7 +166,7 @@ app.get("/buyer/home-stats/:email", verifyJWT, async (req, res) => {
   const email = req.params.email;
 
   if (email !== req.decoded.email) {
-    return res.status(403).send({ message: "Forbidden access" });
+    return res.status(403).send({ message: "Forbidden" });
   }
 
   try {
@@ -174,28 +177,88 @@ app.get("/buyer/home-stats/:email", verifyJWT, async (req, res) => {
     const totalTasks = tasks.length;
 
     const pendingWorkers = tasks.reduce(
-      (sum, task) => sum + (task.required_workers || 0),
+      (sum, task) => sum + Number(task.required_workers || 0),
       0
     );
 
     const payments = await paymentsCollection
-      .find({ email })
+      .find({ email, status: "success" })
       .toArray();
 
     const totalPaid = payments.reduce(
-      (sum, payment) => sum + (payment.amount || 0),
+      (sum, p) => sum + Number(p.amount || 0),
       0
     );
 
-    res.send({
-      totalTasks,
-      pendingWorkers,
-      totalPaid,
-    });
-  } catch (error) {
+    res.send({ totalTasks, pendingWorkers, totalPaid });
+  } catch {
     res.status(500).send({ message: "Server error" });
   }
 });
+
+app.get("/buyer/pending-submissions/:email", verifyJWT, async (req, res) => {
+  const email = req.params.email;
+
+  if (email !== req.decoded.email) {
+    return res.status(403).send({ message: "Forbidden" });
+  }
+
+  const result = await submissionsCollection
+    .find({ buyerEmail: email, status: "pending" })
+    .toArray();
+
+  res.send(result);
+});
+
+app.patch("/buyer/submission/approve/:id", verifyJWT, async (req, res) => {
+  const id = req.params.id;
+
+  const submission = await submissionsCollection.findOne({
+    _id: new ObjectId(id),
+  });
+
+  if (!submission || submission.status !== "pending") {
+    return res.send({ success: false });
+  }
+
+  await submissionsCollection.updateOne(
+    { _id: new ObjectId(id) },
+    { $set: { status: "approved" } }
+  );
+
+  await usersCollection.updateOne(
+    { email: submission.workerEmail },
+    { $inc: { coins: submission.payable_amount } }
+  );
+
+  res.send({ success: true });
+});
+
+app.patch("/buyer/submission/reject/:id", verifyJWT, async (req, res) => {
+  const id = req.params.id;
+
+  const submission = await submissionsCollection.findOne({
+    _id: new ObjectId(id),
+  });
+
+  if (!submission || submission.status !== "pending") {
+    return res.send({ success: false });
+  }
+
+  await submissionsCollection.updateOne(
+    { _id: new ObjectId(id) },
+    { $set: { status: "rejected" } }
+  );
+
+  await tasksCollection.updateOne(
+    { _id: new ObjectId(submission.taskId) },
+    { $inc: { required_workers: 1 } }
+  );
+
+  res.send({ success: true });
+});
+
+
 
 app.post("/tasks", verifyJWT, verifyBuyer, async (req, res) => {
   const task = req.body;
@@ -244,6 +307,160 @@ app.post("/tasks", verifyJWT, verifyBuyer, async (req, res) => {
     message: "Task added successfully",
   });
 });
+
+app.get("/buyer/tasks/:email", verifyJWT, verifyBuyer, async (req, res) => {
+  const email = req.params.email;
+
+  const tasks = await tasksCollection
+    .find({ buyerEmail: email })
+    .sort({ completion_date: -1 })
+    .toArray();
+
+  res.send(tasks);
+});
+app.patch("/buyer/tasks/:id", verifyJWT, verifyBuyer, async (req, res) => {
+  const { id } = req.params;
+  const { task_title, task_detail, submission_info } = req.body;
+
+  const result = await tasksCollection.updateOne(
+    { _id: new ObjectId(id) },
+    {
+      $set: {
+        task_title,
+        task_detail,
+        submission_info,
+      },
+    }
+  );
+
+  res.send({ success: true, result });
+});
+app.delete("/buyer/tasks/:id", verifyJWT, verifyBuyer, async (req, res) => {
+  const { id } = req.params;
+  const email = req.decoded.email;
+
+  const task = await tasksCollection.findOne({ _id: new ObjectId(id) });
+  if (!task) {
+    return res.status(404).send({ message: "Task not found" });
+  }
+
+  const refundAmount = task.required_workers * task.payable_amount;
+
+  await tasksCollection.deleteOne({ _id: new ObjectId(id) });
+
+  await usersCollection.updateOne(
+    { email },
+    { $inc: { coins: refundAmount } }
+  );
+
+  res.send({
+    success: true,
+    refunded: refundAmount,
+  });
+});
+
+// payments related API's
+
+app.post("/create-checkout-session", verifyJWT, async (req, res) => {
+  const { coins, amount } = req.body;
+  const email = req.decoded.email;
+
+  const session = await stripe.checkout.sessions.create({
+    payment_method_types: ["card"],
+    mode: "payment",
+    customer_email: email,
+    line_items: [
+      {
+        price_data: {
+          currency: "usd",
+          unit_amount: amount * 100,
+          product_data: {
+            name: `${coins} Coins`,
+          },
+        },
+        quantity: 1,
+      },
+    ],
+    metadata: {
+      email,
+      coins: coins.toString(),
+      amount: amount.toString(),
+    },
+    success_url: `${process.env.SITE_DOMAIN}/dashboard/buyer/payment-success?session_id={CHECKOUT_SESSION_ID}`,
+    cancel_url: `${process.env.SITE_DOMAIN}/dashboard/buyer/purchase-coin`,
+  });
+
+  res.send({ url: session.url });
+});
+
+
+
+app.post("/payments/confirm", verifyJWT, async (req, res) => {
+  const { sessionId } = req.body;
+  const email = req.decoded.email;
+
+  const session = await stripe.checkout.sessions.retrieve(sessionId, {
+    expand: ["payment_intent"],
+  });
+
+  if (session.payment_status !== "paid") {
+    return res.status(400).send({ message: "Payment not completed" });
+  }
+
+  const paymentIntentId = session.payment_intent.id;
+
+  const alreadyPaid = await paymentsCollection.findOne({ paymentIntentId });
+
+  if (alreadyPaid) {
+    return res.status(409).send({ message: "Payment already confirmed" });
+  }
+
+  const paymentData = {
+    email,
+    coins: Number(session.metadata.coins),
+    amount: Number(session.metadata.amount),
+    paymentIntentId,
+    paymentMethod: "stripe",
+    status: "success",
+    createdAt: new Date(),
+  };
+
+  await paymentsCollection.insertOne(paymentData);
+
+  await usersCollection.updateOne(
+    { email },
+    { $inc: { coins: paymentData.coins } }
+  );
+
+  res.send({ success: true });
+});
+
+app.get(
+  "/payments/history",
+  verifyJWT,
+  verifyBuyer,
+  async (req, res) => {
+    try {
+      const email = req.decoded.email;
+
+      const payments = await paymentsCollection
+        .find({ email })
+        .sort({ createdAt: -1 })
+        .toArray();
+
+      res.send(payments);
+    } catch (error) {
+      console.error(error);
+      res.status(500).send({ message: "Failed to load payment history" });
+    }
+  }
+);
+
+
+
+
+
+
 
 
 
