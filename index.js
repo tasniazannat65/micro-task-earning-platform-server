@@ -359,6 +359,32 @@ app.delete("/buyer/tasks/:id", verifyJWT, verifyBuyer, async (req, res) => {
   });
 });
 
+// worker related API's
+
+app.get("/worker/task-list", verifyJWT, async (req, res) => {
+  try {
+    const tasks = await tasksCollection
+      .find({ required_workers: { $gt: 0 } })
+      .toArray();
+
+    const tasksWithBuyer = await Promise.all(
+      tasks.map(async (task) => {
+        const buyer = await usersCollection.findOne({ email: task.buyerEmail });
+        return {
+          ...task,
+          buyer_name: buyer?.name || "Unknown",
+        };
+      })
+    );
+
+    res.send(tasksWithBuyer);
+  } catch (error) {
+    console.error(error);
+    res.status(500).send({ message: "Server error" });
+  }
+});
+
+
 // payments related API's
 
 app.post("/create-checkout-session", verifyJWT, async (req, res) => {
