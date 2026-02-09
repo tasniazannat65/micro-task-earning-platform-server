@@ -599,6 +599,127 @@ app.get("/worker/approved-submissions/:email", verifyJWT, verifyWorker, async (r
   res.send(approvedSubmissions);
 });
 
+// admin related API's
+
+app.get(
+  "/admin/home-stats",
+  verifyJWT,
+  verifyAdmin,
+  async (req, res) => {
+    try {
+      const totalWorker = await usersCollection.countDocuments({
+        role: "worker",
+      });
+
+      const totalBuyer = await usersCollection.countDocuments({
+        role: "buyer",
+      });
+
+      const users = await usersCollection.find().toArray();
+      const totalAvailableCoin = users.reduce(
+        (sum, user) => sum + (user.coins || 0),
+        0
+      );
+
+      const payments = await paymentsCollection.find().toArray();
+      const totalPayments = payments.reduce(
+        (sum, pay) => sum + (pay.amount || 0),
+        0
+      );
+
+      res.send({
+        totalWorker,
+        totalBuyer,
+        totalAvailableCoin,
+        totalPayments,
+      });
+    } catch (err) {
+      res.status(500).send({ message: "Server error" });
+    }
+  }
+);
+
+app.get(
+  "/admin/withdraw-requests",
+  verifyJWT,
+  verifyAdmin,
+  async (req, res) => {
+    const requests = await withdrawalsCollection
+      .find({ status: "pending" })
+      .sort({ withdraw_date: -1 })
+      .toArray();
+
+    res.send(requests);
+  }
+);
+
+app.patch(
+  "/admin/withdraw-approve/:id",
+  verifyJWT,
+  verifyAdmin,
+  async (req, res) => {
+    const id = req.params.id;
+    const withdraw = await withdrawCollection.findOne({
+      _id: new ObjectId(id),
+    });
+
+    if (!withdraw) {
+      return res.status(404).send({ message: "Withdraw request not found" });
+    }
+
+    await withdrawalsCollection.updateOne(
+      { _id: new ObjectId(id) },
+      { $set: { status: "approved" } }
+    );
+
+    await usersCollection.updateOne(
+      { email: withdraw.worker_email },
+      { $inc: { coins: -withdraw.withdrawal_coin } }
+    );
+
+    res.send({ message: "Withdrawal approved successfully" });
+  }
+);
+
+app.get("/admin/manage-users", verifyJWT, async (req, res) => {
+  try {
+    const users = await usersCollection.find().toArray();
+    res.send(users);
+  } catch (error) {
+    res.status(500).send({ message: "Server error" });
+  }
+});
+
+
+app.delete("/admin/manage-users/:id", verifyJWT, async (req, res) => {
+  const { id } = req.params;
+  try {
+    const result = await usersCollection.deleteOne({ _id: new ObjectId(id) });
+    res.send({ success: !!result.deletedCount });
+  } catch (error) {
+    res.status(500).send({ message: "Server error" });
+  }
+});
+
+
+app.patch("/admin/manage-users/:id/role", verifyJWT, async (req, res) => {
+  const { id } = req.params;
+  const { role } = req.body;
+  if (!["admin", "buyer", "worker"].includes(role)) {
+    return res.status(400).send({ message: "Invalid role" });
+  }
+
+  try {
+    await usersCollection.updateOne(
+      { _id: new ObjectId(id) },
+      { $set: { role } }
+    );
+    res.send({ success: true });
+  } catch (error) {
+    res.status(500).send({ message: "Server error" });
+  }
+});
+
 
 
 
