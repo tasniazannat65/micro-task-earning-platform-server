@@ -58,6 +58,8 @@ async function run() {
             const submissionsCollection = db.collection('submissions');
             const paymentsCollection = db.collection('payments');
             const withdrawalsCollection = db.collection("withdrawals");
+            const notificationsCollection = db.collection("notifications");
+
 
 
             const verifyRole = (requiredRole) => {
@@ -113,6 +115,21 @@ const verifyBuyer = async (req, res, next) => {
 
   next();
 };
+
+const createNotification = async ({
+  message,
+  toEmail,
+  actionRoute
+}) => {
+  await notificationsCollection.insertOne({
+    message,
+    toEmail,
+    actionRoute,
+    isRead: false,
+    createdAt: new Date()
+  });
+};
+
 
 
     // user related API's
@@ -234,6 +251,11 @@ app.patch("/buyer/submission/approve/:id", verifyJWT, async (req, res) => {
     { email: submission.workerEmail },
     { $inc: { coins: submission.payable_amount } }
   );
+  await createNotification({
+  message: `You have earned ${submission.payable_amount} coins from ${submission.buyer_name} for completing ${submission.task_title}`,
+  toEmail: submission.worker_email,
+  actionRoute: "/dashboard/worker-home"
+});
 
   res.send({ success: true });
 });
@@ -258,6 +280,11 @@ app.patch("/buyer/submission/reject/:id", verifyJWT, async (req, res) => {
     { _id: new ObjectId(submission.taskId) },
     { $inc: { required_workers: 1 } }
   );
+  await createNotification({
+  message: `Your submission for ${submission.task_title} was rejected by ${submission.buyer_name}`,
+  toEmail: submission.worker_email,
+  actionRoute: "/dashboard/worker-home"
+});
 
   res.send({ success: true });
 });
@@ -403,38 +430,7 @@ app.get("/worker/task-details/:id", verifyJWT, verifyWorker, async (req, res) =>
   }
 });
 
-app.post("/worker/task-submit/:id", verifyJWT, verifyWorker, async (req, res) => {
-  const taskId = req.params.id;
-  const { submission_details } = req.body;
 
-  if (!submission_details) {
-    return res.status(400).send({ message: "Submission details are required" });
-  }
-
-  try {
-    const task = await tasksCollection.findOne({ _id: new ObjectId(taskId) });
-    if (!task) return res.status(404).send({ message: "Task not found" });
-
-    const submission = {
-      task_id: task._id,
-      task_title: task.task_title,
-      payable_amount: task.payable_amount,
-      worker_email: req.decoded.email,
-      worker_name: req.decoded.name,
-      buyer_name: task.buyerName,
-      buyer_email: task.buyerEmail,
-      submission_details,
-      status: "pending",
-      createdAt: new Date(),
-    };
-
-    await submissionsCollection.insertOne(submission);
-    res.send({ success: true, submission });
-  } catch (error) {
-    console.error(error);
-    res.status(500).send({ message: "Server error" });
-  }
-});
 
 
 
@@ -467,7 +463,11 @@ app.post("/worker/task-submit/:id", verifyJWT, verifyWorker, async (req, res) =>
     };
 
     const result = await submissionsCollection.insertOne(submission);
-
+    await createNotification({
+  message: `New submission received from ${submission.worker_name} for ${submission.task_title}`,
+  toEmail: submission.buyer_email,
+  actionRoute: "/dashboard/buyer-home"
+});
     res.send({ success: true, submissionId: result.insertedId });
   } catch (error) {
     console.error(error);
@@ -676,12 +676,17 @@ app.patch(
       { email: withdraw.worker_email },
       { $inc: { coins: -withdraw.withdrawal_coin } }
     );
+    await createNotification({
+  message: `Your withdrawal request of $${withdraw.withdrawal_amount} has been approved`,
+  toEmail: withdraw.worker_email,
+  actionRoute: "/dashboard/worker/withdrawals"
+});
 
     res.send({ message: "Withdrawal approved successfully" });
   }
 );
 
-app.get("/admin/manage-users", verifyJWT, async (req, res) => {
+app.get("/admin/manage-users", verifyJWT, verifyAdmin, async (req, res) => {
   try {
     const users = await usersCollection.find().toArray();
     res.send(users);
@@ -691,7 +696,7 @@ app.get("/admin/manage-users", verifyJWT, async (req, res) => {
 });
 
 
-app.delete("/admin/manage-users/:id", verifyJWT, async (req, res) => {
+app.delete("/admin/manage-users/:id", verifyJWT, verifyAdmin, async (req, res) => {
   const { id } = req.params;
   try {
     const result = await usersCollection.deleteOne({ _id: new ObjectId(id) });
@@ -702,7 +707,7 @@ app.delete("/admin/manage-users/:id", verifyJWT, async (req, res) => {
 });
 
 
-app.patch("/admin/manage-users/:id/role", verifyJWT, async (req, res) => {
+app.patch("/admin/manage-users/:id/role", verifyJWT, verifyAdmin, async (req, res) => {
   const { id } = req.params;
   const { role } = req.body;
   if (!["admin", "buyer", "worker"].includes(role)) {
@@ -721,7 +726,7 @@ app.patch("/admin/manage-users/:id/role", verifyJWT, async (req, res) => {
 });
 
 
-app.get("/admin/manage-tasks", verifyJWT, async (req, res) => {
+app.get("/admin/manage-tasks", verifyJWT, verifyAdmin, async (req, res) => {
   try {
     const tasks = await tasksCollection.find({}).toArray();
     res.send(tasks);
@@ -731,7 +736,7 @@ app.get("/admin/manage-tasks", verifyJWT, async (req, res) => {
 });
 
 
-app.delete("/admin/manage-tasks/:id", verifyJWT, async (req, res) => {
+app.delete("/admin/manage-tasks/:id", verifyJWT, verifyAdmin, async (req, res) => {
   const { id } = req.params;
   try {
     const result = await tasksCollection.deleteOne({ _id: new ObjectId(id) });
@@ -744,6 +749,33 @@ app.delete("/admin/manage-tasks/:id", verifyJWT, async (req, res) => {
     res.status(500).send({ message: "Server error" });
   }
 });
+
+// notification related API
+
+app.get("/notifications", verifyJWT, async (req, res) => {
+  const email = req.decoded.email;
+
+  const notifications = await notificationsCollection
+    .find({ toEmail: email })
+    .sort({ createdAt: -1 })
+    .limit(10)
+    .toArray();
+
+  const unreadCount = await notificationsCollection.countDocuments({
+    toEmail: email,
+    isRead: false,
+  });
+
+  res.send({ notifications, unreadCount });
+});
+app.patch("/notifications/read/:id", verifyJWT, async (req, res) => {
+  await notificationsCollection.updateOne(
+    { _id: new ObjectId(req.params.id) },
+    { $set: { isRead: true } }
+  );
+  res.send({ success: true });
+});
+
 
 
 
