@@ -473,6 +473,27 @@ app.post("/worker/task-submit/:id", verifyJWT, verifyWorker, async (req, res) =>
   }
 });
 
+app.get("/worker/my-submissions/:email", verifyJWT, async (req, res) => {
+  const email = req.params.email;
+
+  if (email !== req.decoded.email) {
+    return res.status(403).send({ message: "Forbidden access" });
+  }
+
+  try {
+    const submissions = await submissionsCollection
+      .find({ worker_email: email })
+      .sort({ current_date: -1 }) 
+      .toArray();
+
+    res.send(submissions);
+  } catch (error) {
+    console.error(error);
+    res.status(500).send({ message: "Server error while fetching submissions" });
+  }
+});
+
+
 
 // payments related API's
 
