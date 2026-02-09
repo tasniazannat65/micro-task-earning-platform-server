@@ -57,6 +57,8 @@ async function run() {
             const tasksCollection = db.collection('tasks');
             const submissionsCollection = db.collection('submissions');
             const paymentsCollection = db.collection('payments');
+            const withdrawalsCollection = db.collection("withdrawals");
+
 
             const verifyRole = (requiredRole) => {
   return async (req, res, next) => {
@@ -492,6 +494,62 @@ app.get("/worker/my-submissions/:email", verifyJWT, async (req, res) => {
     res.status(500).send({ message: "Server error while fetching submissions" });
   }
 });
+
+app.post("/worker/withdraw", verifyJWT, verifyWorker, async (req, res) => {
+  const {
+    withdrawal_coin,
+    payment_system,
+    account_number,
+  } = req.body;
+
+  const email = req.decoded.email;
+
+  const worker = await usersCollection.findOne({ email });
+
+  if (!worker) {
+    return res.status(404).send({ message: "Worker not found" });
+  }
+
+  if (worker.coins < 200) {
+    return res.status(400).send({ message: "Insufficient coin" });
+  }
+
+  if (withdrawal_coin > worker.coins) {
+    return res.status(400).send({ message: "Coin exceeds balance" });
+  }
+
+  const withdrawal_amount = withdrawal_coin / 20;
+
+  const withdrawalData = {
+    worker_email: email,
+    worker_name: worker.name,
+    withdrawal_coin,
+    withdrawal_amount,
+    payment_system,
+    account_number,
+    status: "pending",
+    withdraw_date: new Date(),
+  };
+
+  await withdrawalsCollection.insertOne(withdrawalData);
+
+  res.send({ success: true });
+});
+
+app.get("/worker/withdrawals/:email", verifyJWT, verifyWorker, async (req, res) => {
+  if (req.params.email !== req.decoded.email) {
+    return res.status(403).send({ message: "Forbidden" });
+  }
+
+  const withdrawals = await withdrawalsCollection
+    .find({ worker_email: req.params.email })
+    .sort({ withdraw_date: -1 })
+    .toArray();
+
+  res.send(withdrawals);
+});
+
+
 
 
 
