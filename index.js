@@ -549,6 +549,57 @@ app.get("/worker/withdrawals/:email", verifyJWT, verifyWorker, async (req, res) 
   res.send(withdrawals);
 });
 
+app.get("/worker/home-stats/:email", verifyJWT, verifyWorker, async (req, res) => {
+  const email = req.params.email;
+
+  if (email !== req.decoded.email) {
+    return res.status(403).send({ message: "Forbidden access" });
+  }
+
+  try {
+    const submissions = await submissionsCollection
+      .find({ worker_email: email })
+      .toArray();
+
+    const totalSubmissions = submissions.length;
+
+    const pendingSubmissions = submissions.filter(
+      sub => sub.status === "pending"
+    ).length;
+
+    const totalEarning = submissions
+      .filter(sub => sub.status === "approved")
+      .reduce((sum, sub) => sum + (sub.payable_amount || 0), 0);
+
+    res.send({
+      totalSubmissions,
+      pendingSubmissions,
+      totalEarning,
+    });
+  } catch (error) {
+    res.status(500).send({ message: "Server error" });
+  }
+});
+
+app.get("/worker/approved-submissions/:email", verifyJWT, verifyWorker, async (req, res) => {
+  const email = req.params.email;
+
+  if (email !== req.decoded.email) {
+    return res.status(403).send({ message: "Forbidden access" });
+  }
+
+  const approvedSubmissions = await submissionsCollection
+    .find({
+      worker_email: email,
+      status: "approved",
+    })
+    .sort({ createdAt: -1 })
+    .toArray();
+
+  res.send(approvedSubmissions);
+});
+
+
 
 
 
