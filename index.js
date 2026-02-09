@@ -721,6 +721,32 @@ app.patch("/admin/manage-users/:id/role", verifyJWT, async (req, res) => {
 });
 
 
+app.get("/admin/manage-tasks", verifyJWT, async (req, res) => {
+  try {
+    const tasks = await tasksCollection.find({}).toArray();
+    res.send(tasks);
+  } catch (error) {
+    res.status(500).send({ message: "Server error" });
+  }
+});
+
+
+app.delete("/admin/manage-tasks/:id", verifyJWT, async (req, res) => {
+  const { id } = req.params;
+  try {
+    const result = await tasksCollection.deleteOne({ _id: new ObjectId(id) });
+    if (result.deletedCount > 0) {
+      res.send({ success: true });
+    } else {
+      res.send({ success: false });
+    }
+  } catch (error) {
+    res.status(500).send({ message: "Server error" });
+  }
+});
+
+
+
 
 
 
