@@ -134,12 +134,13 @@ const createNotification = async ({
 
     // user related API's
 
- app.post("/users", async (req, res) => {
+app.post("/users", async (req, res) => {
   const user = req.body;
 
-  const exists = await usersCollection.findOne({ email: user.email });
-  if (exists) {
-    return res.send({ message: "User already exists" });
+  const existingUser = await usersCollection.findOne({ email: user.email });
+
+  if (existingUser) {
+    return res.send({ success: true });
   }
 
   const role = user.role ? user.role.toLowerCase() : "worker";
@@ -148,7 +149,7 @@ const createNotification = async ({
     name: user.name,
     email: user.email,
     image: user.image,
-    role: role,                     
+    role: role,
     coins: role === "worker" ? 10 : 50,
     createdAt: new Date(),
   };
@@ -158,17 +159,33 @@ const createNotification = async ({
 });
 
 
-    app.get("/users/:email", verifyJWT, async (req, res) => {
-      if (req.params.email !== req.decoded.email) {
-        return res.status(403).send({ message: "Forbidden" });
-      }
+app.get("/users/:email", verifyJWT, async (req, res) => {
+  try {
+    const email = req.params.email;
 
-      const user = await usersCollection.findOne({
-        email: req.params.email,
-      });
+    if (!req.decoded?.email) {
+      return res.status(401).send({ message: "Unauthorized" });
+    }
 
-      res.send(user);
-    });
+    if (email !== req.decoded.email) {
+      return res.status(403).send({ message: "Forbidden access" });
+    }
+
+    const user = await usersCollection.findOne({ email: email });
+
+    if (!user) {
+      return res.status(404).send({ message: "User not found" });
+    }
+
+    res.send(user);
+  } catch (error) {
+    console.error("Error fetching user:", error);
+    res.status(500).send({ message: "Internal Server Error" });
+  }
+});
+
+
+
 app.get("/users/me", verifyJWT, async (req, res) => {
   const email = req.decoded.email;
 
@@ -181,6 +198,20 @@ app.get("/users/me", verifyJWT, async (req, res) => {
   res.send(user);
 });
 
+app.get("/best-workers", async (req, res) => {
+  const workers = await usersCollection
+    .find({ role: "worker" }) 
+    .sort({ coins: -1 })
+    .limit(6)
+    .project({ name: 1, image: 1, coins: 1 })
+    .toArray();
+
+  res.send(workers);
+});
+
+
+
+
 // buyer related API's
 
 app.get("/buyer/home-stats/:email", verifyJWT, async (req, res) => {
@@ -191,28 +222,54 @@ app.get("/buyer/home-stats/:email", verifyJWT, async (req, res) => {
   }
 
   try {
-    const tasks = await tasksCollection
-      .find({ buyerEmail: email })
-      .toArray();
+    const totalTasks = await tasksCollection.countDocuments({
+      buyerEmail: email,
+    });
 
-    const totalTasks = tasks.length;
+    const pendingWorkersAgg = await tasksCollection.aggregate([
+      {
+        $match: { buyerEmail: email },
+      },
+      {
+        $group: {
+          _id: null,
+          totalPendingWorkers: {
+            $sum: { $toInt: "$required_workers" },
+          },
+        },
+      },
+    ]).toArray();
 
-    const pendingWorkers = tasks.reduce(
-      (sum, task) => sum + Number(task.required_workers || 0),
-      0
-    );
+    const pendingWorkers = pendingWorkersAgg[0]?.totalPendingWorkers || 0;
 
-    const payments = await paymentsCollection
-      .find({ email, status: "success" })
-      .toArray();
+    // Total paid amount
+    const totalPaidAgg = await paymentsCollection.aggregate([
+      {
+        $match: {
+          email: email,
+          status: "success",
+        },
+      },
+      {
+        $group: {
+          _id: null,
+          totalPaid: {
+            $sum: { $toDouble: "$amount" },
+          },
+        },
+      },
+    ]).toArray();
 
-    const totalPaid = payments.reduce(
-      (sum, p) => sum + Number(p.amount || 0),
-      0
-    );
+    const totalPaid = totalPaidAgg[0]?.totalPaid || 0;
 
-    res.send({ totalTasks, pendingWorkers, totalPaid });
-  } catch {
+    res.send({
+      totalTasks,
+      pendingWorkers,
+      totalPaid,
+    });
+
+  } catch (error) {
+    console.error(error);
     res.status(500).send({ message: "Server error" });
   }
 });
@@ -224,11 +281,31 @@ app.get("/buyer/pending-submissions/:email", verifyJWT, async (req, res) => {
     return res.status(403).send({ message: "Forbidden" });
   }
 
-  const result = await submissionsCollection
-    .find({ buyerEmail: email, status: "pending" })
-    .toArray();
+  const page = parseInt(req.query.page) || 1;
+  const limit = parseInt(req.query.limit) || 5;
+  const skip = (page - 1) * limit;
 
-  res.send(result);
+  const query = { buyer_email: email, status: "pending" };
+
+  try {
+    const total = await submissionsCollection.countDocuments(query);
+
+    const submissions = await submissionsCollection
+      .find(query)
+      .sort({ createdAt: -1 })
+      .skip(skip)
+      .limit(limit)
+      .toArray();
+
+    res.send({
+      submissions,
+      total,
+      totalPages: Math.ceil(total / limit),
+      currentPage: page,
+    });
+  } catch (error) {
+    res.status(500).send({ message: "Server error" });
+  }
 });
 
 app.patch("/buyer/submission/approve/:id", verifyJWT, async (req, res) => {
@@ -248,7 +325,7 @@ app.patch("/buyer/submission/approve/:id", verifyJWT, async (req, res) => {
   );
 
   await usersCollection.updateOne(
-    { email: submission.workerEmail },
+    { email: submission.worker_email },
     { $inc: { coins: submission.payable_amount } }
   );
   await createNotification({
@@ -342,12 +419,28 @@ app.post("/tasks", verifyJWT, verifyBuyer, async (req, res) => {
 app.get("/buyer/tasks/:email", verifyJWT, verifyBuyer, async (req, res) => {
   const email = req.params.email;
 
+  const page = parseInt(req.query.page) || 1;
+  const limit = parseInt(req.query.limit) || 5;
+
+  const skip = (page - 1) * limit;
+
+  const query = { buyerEmail: email };
+
+  const totalTasks = await tasksCollection.countDocuments(query);
+
   const tasks = await tasksCollection
-    .find({ buyerEmail: email })
+    .find(query)
     .sort({ completion_date: -1 })
+    .skip(skip)
+    .limit(limit)
     .toArray();
 
-  res.send(tasks);
+  res.send({
+    tasks,
+    totalTasks,
+    currentPage: page,
+    totalPages: Math.ceil(totalTasks / limit),
+  });
 });
 app.patch("/buyer/tasks/:id", verifyJWT, verifyBuyer, async (req, res) => {
   const { id } = req.params;
@@ -370,9 +463,13 @@ app.delete("/buyer/tasks/:id", verifyJWT, verifyBuyer, async (req, res) => {
   const { id } = req.params;
   const email = req.decoded.email;
 
-  const task = await tasksCollection.findOne({ _id: new ObjectId(id) });
+  const task = await tasksCollection.findOne({
+    _id: new ObjectId(id),
+    buyerEmail: email
+  });
+
   if (!task) {
-    return res.status(404).send({ message: "Task not found" });
+    return res.status(404).send({ message: "Task not found or not yours" });
   }
 
   const refundAmount = task.required_workers * task.payable_amount;
@@ -394,8 +491,20 @@ app.delete("/buyer/tasks/:id", verifyJWT, verifyBuyer, async (req, res) => {
 
 app.get("/worker/task-list", verifyJWT, verifyWorker, async (req, res) => {
   try {
+
+    const page = parseInt(req.query.page) || 1;
+    const limit = parseInt(req.query.limit) || 6;
+
+    const skip = (page - 1) * limit;
+
+    const query = { required_workers: { $gt: 0 } };
+
+    const totalTasks = await tasksCollection.countDocuments(query);
+
     const tasks = await tasksCollection
-      .find({ required_workers: { $gt: 0 } })
+      .find(query)
+      .skip(skip)
+      .limit(limit)
       .toArray();
 
     const tasksWithBuyer = await Promise.all(
@@ -408,7 +517,13 @@ app.get("/worker/task-list", verifyJWT, verifyWorker, async (req, res) => {
       })
     );
 
-    res.send(tasksWithBuyer);
+    res.send({
+      tasks: tasksWithBuyer,
+      totalTasks,
+      currentPage: page,
+      totalPages: Math.ceil(totalTasks / limit)
+    });
+
   } catch (error) {
     console.error(error);
     res.status(500).send({ message: "Server error" });
@@ -477,30 +592,39 @@ app.post("/worker/task-submit/:id", verifyJWT, verifyWorker, async (req, res) =>
 
 app.get("/worker/my-submissions/:email", verifyJWT, async (req, res) => {
   const email = req.params.email;
-
   if (email !== req.decoded.email) {
     return res.status(403).send({ message: "Forbidden access" });
   }
 
   try {
+    const page = parseInt(req.query.page) || 1; 
+    const limit = parseInt(req.query.limit) || 5; 
+    const skip = (page - 1) * limit;
+
+    const totalCount = await submissionsCollection.countDocuments({ worker_email: email });
+
     const submissions = await submissionsCollection
       .find({ worker_email: email })
-      .sort({ current_date: -1 }) 
+      .sort({ current_date: -1 })
+      .skip(skip)
+      .limit(limit)
       .toArray();
 
-    res.send(submissions);
+    res.send({
+      submissions,
+      page,
+      totalPages: Math.ceil(totalCount / limit),
+      totalCount,
+    });
   } catch (error) {
     console.error(error);
     res.status(500).send({ message: "Server error while fetching submissions" });
   }
 });
 
+
 app.post("/worker/withdraw", verifyJWT, verifyWorker, async (req, res) => {
-  const {
-    withdrawal_coin,
-    payment_system,
-    account_number,
-  } = req.body;
+  const { withdrawal_coin, payment_system, account_number } = req.body;
 
   const email = req.decoded.email;
 
@@ -510,8 +634,8 @@ app.post("/worker/withdraw", verifyJWT, verifyWorker, async (req, res) => {
     return res.status(404).send({ message: "Worker not found" });
   }
 
-  if (worker.coins < 200) {
-    return res.status(400).send({ message: "Insufficient coin" });
+  if (withdrawal_coin < 200) {
+    return res.status(400).send({ message: "Minimum withdraw is 200 coins" });
   }
 
   if (withdrawal_coin > worker.coins) {
@@ -533,10 +657,13 @@ app.post("/worker/withdraw", verifyJWT, verifyWorker, async (req, res) => {
 
   await withdrawalsCollection.insertOne(withdrawalData);
 
+  
+
   res.send({ success: true });
 });
 
 app.get("/worker/withdrawals/:email", verifyJWT, verifyWorker, async (req, res) => {
+
   if (req.params.email !== req.decoded.email) {
     return res.status(403).send({ message: "Forbidden" });
   }
@@ -557,19 +684,23 @@ app.get("/worker/home-stats/:email", verifyJWT, verifyWorker, async (req, res) =
   }
 
   try {
-    const submissions = await submissionsCollection
-      .find({ worker_email: email })
+    const totalSubmissions = await submissionsCollection.countDocuments({
+      worker_email: email,
+    });
+
+    const pendingSubmissions = await submissionsCollection.countDocuments({
+      worker_email: email,
+      status: "pending",
+    });
+
+    const approved = await submissionsCollection
+      .find({ worker_email: email, status: "approved" })
       .toArray();
 
-    const totalSubmissions = submissions.length;
-
-    const pendingSubmissions = submissions.filter(
-      sub => sub.status === "pending"
-    ).length;
-
-    const totalEarning = submissions
-      .filter(sub => sub.status === "approved")
-      .reduce((sum, sub) => sum + (sub.payable_amount || 0), 0);
+    const totalEarning = approved.reduce(
+      (sum, sub) => sum + (sub.payable_amount || 0),
+      0
+    );
 
     res.send({
       totalSubmissions,
@@ -581,23 +712,48 @@ app.get("/worker/home-stats/:email", verifyJWT, verifyWorker, async (req, res) =
   }
 });
 
-app.get("/worker/approved-submissions/:email", verifyJWT, verifyWorker, async (req, res) => {
-  const email = req.params.email;
+app.get(
+  "/worker/approved-submissions/:email",
+  verifyJWT,
+  verifyWorker,
+  async (req, res) => {
+    const email = req.params.email;
 
-  if (email !== req.decoded.email) {
-    return res.status(403).send({ message: "Forbidden access" });
-  }
+    if (email !== req.decoded.email) {
+      return res.status(403).send({ message: "Forbidden access" });
+    }
 
-  const approvedSubmissions = await submissionsCollection
-    .find({
+    const page = parseInt(req.query.page) || 1;
+    const limit = parseInt(req.query.limit) || 5;
+
+    const skip = (page - 1) * limit;
+
+    const query = {
       worker_email: email,
       status: "approved",
-    })
-    .sort({ createdAt: -1 })
-    .toArray();
+    };
 
-  res.send(approvedSubmissions);
-});
+    try {
+      const total = await submissionsCollection.countDocuments(query);
+
+      const approvedSubmissions = await submissionsCollection
+        .find(query)
+        .sort({ createdAt: -1 })
+        .skip(skip)
+        .limit(limit)
+        .toArray();
+
+      res.send({
+        submissions: approvedSubmissions,
+        total,
+        totalPages: Math.ceil(total / limit),
+        currentPage: page,
+      });
+    } catch (error) {
+      res.status(500).send({ message: "Server error" });
+    }
+  }
+);
 
 // admin related API's
 
@@ -644,14 +800,36 @@ app.get(
   verifyJWT,
   verifyAdmin,
   async (req, res) => {
-    const requests = await withdrawalsCollection
-      .find({ status: "pending" })
-      .sort({ withdraw_date: -1 })
-      .toArray();
+    try {
+      const page = parseInt(req.query.page) || 1;
+      const limit = parseInt(req.query.limit) || 5;
 
-    res.send(requests);
+      const skip = (page - 1) * limit;
+
+      const query = { status: "pending" };
+
+      const totalRequests = await withdrawalsCollection.countDocuments(query);
+
+      const requests = await withdrawalsCollection
+        .find(query)
+        .sort({ withdraw_date: -1 })
+        .skip(skip)
+        .limit(limit)
+        .toArray();
+
+      res.send({
+        requests,
+        totalPages: Math.ceil(totalRequests / limit),
+        currentPage: page,
+        totalRequests,
+      });
+
+    } catch (error) {
+      res.status(500).send({ message: "Server error" });
+    }
   }
 );
+
 
 app.patch(
   "/admin/withdraw-approve/:id",
@@ -659,12 +837,17 @@ app.patch(
   verifyAdmin,
   async (req, res) => {
     const id = req.params.id;
-    const withdraw = await withdrawCollection.findOne({
+
+    const withdraw = await withdrawalsCollection.findOne({
       _id: new ObjectId(id),
     });
 
     if (!withdraw) {
       return res.status(404).send({ message: "Withdraw request not found" });
+    }
+
+    if (withdraw.status === "approved") {
+      return res.send({ message: "Already approved" });
     }
 
     await withdrawalsCollection.updateOne(
@@ -676,11 +859,12 @@ app.patch(
       { email: withdraw.worker_email },
       { $inc: { coins: -withdraw.withdrawal_coin } }
     );
+
     await createNotification({
-  message: `Your withdrawal request of $${withdraw.withdrawal_amount} has been approved`,
-  toEmail: withdraw.worker_email,
-  actionRoute: "/dashboard/worker/withdrawals"
-});
+      message: `Your withdrawal request of $${withdraw.withdrawal_amount} has been approved`,
+      toEmail: withdraw.worker_email,
+      actionRoute: "/dashboard/worker/withdrawals"
+    });
 
     res.send({ message: "Withdrawal approved successfully" });
   }
@@ -688,8 +872,26 @@ app.patch(
 
 app.get("/admin/manage-users", verifyJWT, verifyAdmin, async (req, res) => {
   try {
-    const users = await usersCollection.find().toArray();
-    res.send(users);
+    const page = parseInt(req.query.page) || 1;
+    const limit = parseInt(req.query.limit) || 5;
+
+    const skip = (page - 1) * limit;
+
+    const totalUsers = await usersCollection.countDocuments();
+
+    const users = await usersCollection
+      .find()
+      .skip(skip)
+      .limit(limit)
+      .toArray();
+
+    res.send({
+      users,
+      totalUsers,
+      currentPage: page,
+      totalPages: Math.ceil(totalUsers / limit),
+    });
+
   } catch (error) {
     res.status(500).send({ message: "Server error" });
   }
@@ -728,8 +930,27 @@ app.patch("/admin/manage-users/:id/role", verifyJWT, verifyAdmin, async (req, re
 
 app.get("/admin/manage-tasks", verifyJWT, verifyAdmin, async (req, res) => {
   try {
-    const tasks = await tasksCollection.find({}).toArray();
-    res.send(tasks);
+
+    const page = parseInt(req.query.page) || 1;
+    const limit = parseInt(req.query.limit) || 5;
+
+    const skip = (page - 1) * limit;
+
+    const totalTasks = await tasksCollection.countDocuments();
+
+    const tasks = await tasksCollection
+      .find({})
+      .skip(skip)
+      .limit(limit)
+      .toArray();
+
+    res.send({
+      tasks,
+      totalTasks,
+      currentPage: page,
+      totalPages: Math.ceil(totalTasks / limit),
+    });
+
   } catch (error) {
     res.status(500).send({ message: "Server error" });
   }
@@ -867,12 +1088,29 @@ app.get(
     try {
       const email = req.decoded.email;
 
+      const page = parseInt(req.query.page) || 1;
+      const limit = parseInt(req.query.limit) || 5;
+
+      const skip = (page - 1) * limit;
+
+      const query = { email };
+
+      const totalPayments = await paymentsCollection.countDocuments(query);
+
       const payments = await paymentsCollection
-        .find({ email })
+        .find(query)
         .sort({ createdAt: -1 })
+        .skip(skip)
+        .limit(limit)
         .toArray();
 
-      res.send(payments);
+      res.send({
+        payments,
+        totalPayments,
+        currentPage: page,
+        totalPages: Math.ceil(totalPayments / limit),
+      });
+
     } catch (error) {
       console.error(error);
       res.status(500).send({ message: "Failed to load payment history" });
