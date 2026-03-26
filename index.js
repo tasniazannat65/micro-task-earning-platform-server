@@ -10,7 +10,10 @@ const stripe = new Stripe(process.env.STRIPE_SECRET);
 const port = process.env.PORT || 3000;
 const { MongoClient, ServerApiVersion, ObjectId } = require('mongodb');
 const uri = process.env.DB_URL;
-const serviceAccount = require("./zentaskly-firebase-adminsdk-key.json");
+// const serviceAccount = require("./zentaskly-firebase-adminsdk-key.json");
+const serviceAccount = JSON.parse(
+  Buffer.from(process.env.FIREBASE_KEY, "base64").toString("utf-8")
+);
 // Create a MongoClient with a MongoClientOptions object to set the Stable API version
 const client = new MongoClient(uri, {
   serverApi: {
@@ -51,7 +54,7 @@ const verifyJWT = async (req, res, next) => {
 async function run() {
   try {
     // Connect the client to the server	(optional starting in v4.7)
-    await client.connect();
+    // await client.connect();
             const db = client.db('Zentaskly_DB');
             const usersCollection = db.collection('users');
             const tasksCollection = db.collection('tasks');
@@ -1131,8 +1134,8 @@ app.get(
 
 
     // Send a ping to confirm a successful connection
-    await client.db("admin").command({ ping: 1 });
-    console.log("Pinged your deployment. You successfully connected to MongoDB!");
+    // await client.db("admin").command({ ping: 1 });
+    // console.log("Pinged your deployment. You successfully connected to MongoDB!");
   } finally {
     // Ensures that the client will close when you finish/error
     // await client.close();
